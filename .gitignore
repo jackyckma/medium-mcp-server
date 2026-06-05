@@ -83,6 +83,11 @@ jspm_packages/
 medium-session.json
 playwright-session.json
 session-*.json
+# Persistent auth session + Chrome profile (contain login cookies — never commit)
+.medium-mcp-session.json
+.medium-mcp-chrome/
+*-session.json
+*.session.json
 
 # Test files (development only)
 test-*.js

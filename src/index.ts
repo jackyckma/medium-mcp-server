@@ -28,7 +28,7 @@ class MediumMcpServer {
     // Tool for publishing articles (now browser-based)
     this.server.tool(
       "publish-article",
-      "Publish a new article on Medium using browser automation",
+      "Publish a new article on Medium using browser automation. On the first use (no saved session) a one-time login window may open; after that the session is reused silently in the background.",
       {
         title: z.string().min(1, "Title is required"),
         content: z.string().min(10, "Content must be at least 10 characters"),
@@ -69,7 +69,7 @@ class MediumMcpServer {
     // Tool for retrieving user's published articles
     this.server.tool(
       "get-my-articles",
-      "Retrieve your published Medium articles",
+      "Retrieve your published Medium articles. On the first use (no saved session) a one-time login window may open; after that the session is reused silently in the background.",
       {},
       async () => {
         try {
@@ -100,10 +100,10 @@ class MediumMcpServer {
     // Tool for getting full content of a specific article
     this.server.tool(
       "get-article-content",
-      "Get the full content of a Medium article by URL",
+      "Get the full content of a Medium article by URL. When requireLogin is true and there is no saved session, a one-time login window may open on first use; after that the session is reused silently in the background.",
       {
         url: z.string().url("Must be a valid URL"),
-        requireLogin: z.boolean().optional().default(true).describe("Whether to attempt login for full content access")
+        requireLogin: z.boolean().optional().default(true).describe("If true, ensures you are logged in (may open a one-time login window on first use) to access full/member-only content. Set false for preview-only content without login.")
       },
       async (args) => {
         try {
@@ -199,9 +199,10 @@ class MediumMcpServer {
   // Method to start the server
   async start() {
     try {
-      // Initialize browser client
+      // Browser is launched lazily (headless) on first tool use — no window
+      // appears at startup. A visible window only opens for one-time login.
       await this.mediumClient.initialize();
-      console.error("🌐 Browser Medium client initialized");
+      console.error("🌐 Browser Medium client ready (lazy, headless)");
 
       const transport = new StdioServerTransport();
       await this.server.connect(transport);
