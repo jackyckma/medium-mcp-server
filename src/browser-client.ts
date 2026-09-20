@@ -1,23 +1,19 @@
 import 'dotenv/config';
 import { chromium, Browser, Page, BrowserContext } from 'playwright';
-import { writeFileSync, readFileSync, existsSync, mkdirSync, chmodSync } from 'fs';
+import { writeFileSync, readFileSync, existsSync, chmodSync } from 'fs';
 import { join } from 'path';
-import { homedir } from 'os';
 
 // Configurable via environment
 const HEADLESS = process.env.MEDIUM_HEADLESS === '1' || process.env.MEDIUM_HEADLESS === 'true';
 const configuredContentLength = Number(process.env.MEDIUM_MAX_CONTENT_LENGTH || '50000');
 const MAX_CONTENT_LENGTH = Number.isSafeInteger(configuredContentLength) && configuredContentLength > 0
   ? configuredContentLength : 50000;
-const SESSION_DIR = process.env.MEDIUM_SESSION_DIR || join(homedir(), '.medium-mcp');
-const ALLOWED_HOSTS = (process.env.MEDIUM_ALLOWED_HOSTS || 'medium.com')
-  .split(',').map(h => h.trim().toLowerCase()).filter(Boolean);
 
 function isAllowedMediumUrl(raw: string): boolean {
   try {
     const u = new URL(raw);
     const host = u.hostname.toLowerCase();
-    return ALLOWED_HOSTS.some(h => host === h || host.endsWith('.' + h));
+    return u.protocol === 'https:' && (host === 'medium.com' || host.endsWith('.medium.com'));
   } catch {
     return false;
   }
@@ -43,7 +39,7 @@ export class BrowserMediumClient {
   private browser: Browser | null = null;
   private context: BrowserContext | null = null;
   private page: Page | null = null;
-  private sessionPath = join(SESSION_DIR, 'medium-session.json');
+  private sessionPath = join(process.cwd(), 'medium-session.json');
   private initialization: Promise<void> | null = null;
 
   async initialize(): Promise<void> {
@@ -59,10 +55,6 @@ export class BrowserMediumClient {
 
   private async initializeBrowser(): Promise<void> {
     try {
-      if (!existsSync(SESSION_DIR)) {
-        mkdirSync(SESSION_DIR, { recursive: true, mode: 0o700 });
-      }
-
       this.browser = await chromium.launch({
         headless: HEADLESS,
         args: [
@@ -240,13 +232,17 @@ export class BrowserMediumClient {
     if (!this.page || !this.context) throw new Error('Browser not initialized');
 
     if (!isAllowedMediumUrl(url)) {
-      throw new Error(`Refusing to navigate to non-Medium URL: ${url}. Allowed hosts: ${ALLOWED_HOSTS.join(', ')}. Extend via MEDIUM_ALLOWED_HOSTS env.`);
+      throw new Error(`Refusing to navigate to non-Medium HTTPS URL: ${url}`);
     }
     
     console.error(`📖 Fetching article content from: ${url}`);
     
-    if (requireLogin && !(await this.ensureLoggedIn())) {
-      throw new Error('Medium login required but not observed');
+    if (requireLogin) {
+      try {
+        await this.ensureLoggedIn();
+      } catch (error) {
+        console.error('Login unavailable; attempting public article access:', error);
+      }
     }
 
     const articlePage = await this.context.newPage();
