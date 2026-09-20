@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import { chromium, Browser, Page, BrowserContext } from 'playwright';
 import { writeFileSync, readFileSync, existsSync, mkdirSync, chmodSync } from 'fs';
 import { join } from 'path';
@@ -5,21 +6,12 @@ import { homedir } from 'os';
 
 // Configurable via environment
 const HEADLESS = process.env.MEDIUM_HEADLESS === '1' || process.env.MEDIUM_HEADLESS === 'true';
-const MAX_CONTENT_LENGTH = parseInt(process.env.MEDIUM_MAX_CONTENT_LENGTH || '50000', 10);
+const configuredContentLength = Number(process.env.MEDIUM_MAX_CONTENT_LENGTH || '50000');
+const MAX_CONTENT_LENGTH = Number.isSafeInteger(configuredContentLength) && configuredContentLength > 0
+  ? configuredContentLength : 50000;
 const SESSION_DIR = process.env.MEDIUM_SESSION_DIR || join(homedir(), '.medium-mcp');
 const ALLOWED_HOSTS = (process.env.MEDIUM_ALLOWED_HOSTS || 'medium.com')
   .split(',').map(h => h.trim().toLowerCase()).filter(Boolean);
-
-function defaultUserAgent(): string {
-  const platform = process.platform;
-  if (platform === 'win32') {
-    return 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
-  }
-  if (platform === 'darwin') {
-    return 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
-  }
-  return 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
-}
 
 function isAllowedMediumUrl(raw: string): boolean {
   try {
@@ -37,7 +29,7 @@ export interface MediumArticle {
   url?: string;
   publishDate?: string;
   tags?: string[];
-  claps?: number;
+  claps?: number | null;
 }
 
 export interface PublishOptions {
@@ -52,65 +44,79 @@ export class BrowserMediumClient {
   private context: BrowserContext | null = null;
   private page: Page | null = null;
   private sessionPath = join(SESSION_DIR, 'medium-session.json');
-  private profileDir = join(SESSION_DIR, 'chrome-profile');
+  private initialization: Promise<void> | null = null;
 
   async initialize(): Promise<void> {
-    if (!existsSync(SESSION_DIR)) {
-      mkdirSync(SESSION_DIR, { recursive: true, mode: 0o700 });
+    if (this.initialization) return this.initialization;
+    if (this.browser) return;
+    this.initialization = this.initializeBrowser();
+    try {
+      await this.initialization;
+    } finally {
+      this.initialization = null;
     }
+  }
 
-    this.browser = await chromium.launch({
-      headless: HEADLESS,
-      args: [
-        '--no-first-run',
-        '--no-default-browser-check',
-        '--disable-blink-features=AutomationControlled',
-        '--disable-features=VizDisplayCompositor',
-        '--disable-features=TranslateUI',
-        '--disable-ipc-flooding-protection',
-        '--disable-dev-shm-usage',
-        `--user-agent=${defaultUserAgent()}`
-      ]
-    });
-
-    const contextOptions: any = {
-      viewport: { width: 1280, height: 900 },
-      userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-    };
-
-    if (existsSync(this.sessionPath)) {
-      try {
-        const sessionData = JSON.parse(readFileSync(this.sessionPath, 'utf8'));
-        contextOptions.storageState = sessionData;
-      } catch (error) {
-        console.error('Failed to load session:', error);
+  private async initializeBrowser(): Promise<void> {
+    try {
+      if (!existsSync(SESSION_DIR)) {
+        mkdirSync(SESSION_DIR, { recursive: true, mode: 0o700 });
       }
-    }
 
-    this.context = await this.browser.newContext(contextOptions);
-
-    await this.context.addInitScript(() => {
-      Object.defineProperty(navigator, 'webdriver', {
-        get: () => undefined,
+      this.browser = await chromium.launch({
+        headless: HEADLESS,
+        args: [
+          '--no-first-run',
+          '--no-default-browser-check',
+          '--disable-blink-features=AutomationControlled',
+          '--disable-features=VizDisplayCompositor',
+          '--disable-features=TranslateUI',
+          '--disable-ipc-flooding-protection',
+          '--disable-dev-shm-usage'
+        ]
       });
-      delete (window as any).cdc_adoQpoasnfa76pfcZLmcfl_Array;
-      delete (window as any).cdc_adoQpoasnfa76pfcZLmcfl_Promise;
-      delete (window as any).cdc_adoQpoasnfa76pfcZLmcfl_Symbol;
-    });
 
-    this.page = await this.context.newPage();
+      const contextOptions: any = {
+        viewport: { width: 1280, height: 900 },
+        userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+      };
+
+      if (existsSync(this.sessionPath)) {
+        try {
+          const sessionData = JSON.parse(readFileSync(this.sessionPath, 'utf8'));
+          contextOptions.storageState = sessionData;
+        } catch (error) {
+          console.error('Failed to load session:', error);
+        }
+      }
+
+      this.context = await this.browser.newContext(contextOptions);
+
+      await this.context.addInitScript(() => {
+        Object.defineProperty(navigator, 'webdriver', {
+          get: () => undefined,
+        });
+        delete (window as any).cdc_adoQpoasnfa76pfcZLmcfl_Array;
+        delete (window as any).cdc_adoQpoasnfa76pfcZLmcfl_Promise;
+        delete (window as any).cdc_adoQpoasnfa76pfcZLmcfl_Symbol;
+      });
+
+      this.page = await this.context.newPage();
+    } catch (error) {
+      try {
+        await this.browser?.close();
+      } finally {
+        this.browser = null;
+        this.context = null;
+        this.page = null;
+      }
+      throw error;
+    }
   }
 
   async ensureLoggedIn(): Promise<boolean> {
     if (!this.page) throw new Error('Browser not initialized');
 
-    // If we have a saved session, trust it — don't trigger interactive login
-    if (existsSync(this.sessionPath)) {
-      console.error('💾 Found existing session file, trusting it (no interactive login)');
-      return true;
-    }
-
-    // No saved session — navigate to Medium and check login status
     await this.page.goto('https://medium.com', { waitUntil: 'domcontentloaded' });
     await this.page.waitForTimeout(3000);
     
@@ -119,11 +125,7 @@ export class BrowserMediumClient {
       // Try multiple selectors for logged-in state
       const loginSelectors = [
         '[data-testid="headerUserButton"]',
-        '.avatar',
         '[data-testid="user-menu"]',
-        'button[aria-label*="user"]',
-        'img[alt*="avatar"]',
-        '[data-testid="write-button"]', // Write button only appears when logged in
         'a[href="/me/stories"]'
       ];
       
@@ -149,6 +151,8 @@ export class BrowserMediumClient {
     } catch {
       console.error('❌ Not logged in. Please log in manually...');
       
+      if (HEADLESS) return false;
+
       // Navigate to login page
       await this.page.goto('https://medium.com/m/signin');
       
@@ -168,7 +172,7 @@ export class BrowserMediumClient {
       
       // Wait for successful login (user button appears)
       try {
-        await this.page.waitForSelector('[data-testid="headerUserButton"], .avatar, [data-testid="user-menu"]', { timeout: 300000 }); // 5 minutes
+        await this.page.waitForSelector('[data-testid="headerUserButton"], [data-testid="user-menu"], a[href="/me/stories"]', { timeout: 300000 }); // 5 minutes
         console.error('✅ Login successful!');
         await this.saveSession();
         return true;
@@ -241,20 +245,12 @@ export class BrowserMediumClient {
     
     console.error(`📖 Fetching article content from: ${url}`);
     
-    // Trust saved session if it exists — don't do a separate homepage navigation
-    // (the homepage→article double navigation triggers extra Cloudflare challenges)
-    if (existsSync(this.sessionPath)) {
-      console.error('💾 Using saved session for article fetch');
-    } else if (requireLogin) {
-      console.error('🔐 No saved session. Attempting login for full content access...');
-      await this.ensureLoggedIn();
-    } else {
-      console.error('🔓 No session, will get preview content only.');
+    if (requireLogin && !(await this.ensureLoggedIn())) {
+      throw new Error('Medium login required but not observed');
     }
-    
+
+    const articlePage = await this.context.newPage();
     try {
-      // Use a fresh page (new tab) to avoid navigation history triggering Cloudflare
-      const articlePage = await this.context.newPage();
       console.error(`🌐 Navigating to article (new tab): ${url}`);
       await articlePage.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
 
@@ -282,7 +278,7 @@ export class BrowserMediumClient {
       console.error('📄 Page loaded, extracting content...');
 
       // Extract article content with multiple strategies
-      const content = await articlePage.evaluate((maxLen: number) => {
+      const content = await articlePage.evaluate(() => {
         const log = (...args: any[]) => {
           // Silent in browser context to avoid JSON interference
         };
@@ -360,8 +356,7 @@ export class BrowserMediumClient {
                 // Clean up the text a bit
                 extractedContent = text
                   .replace(/\s+/g, ' ') // Normalize whitespace
-                  .replace(/(.{100})/g, '$1\n\n') // Add paragraph breaks
-                  .substring(0, maxLen); // Limit length
+                  .replace(/(.{100})/g, '$1\n\n');
                 
                 log(`✅ Fallback extraction successful using: ${selector}`);
                 break;
@@ -428,15 +423,19 @@ export class BrowserMediumClient {
         
         log(`📊 Final content length: ${extractedContent.length} characters`);
         return extractedContent;
-      }, MAX_CONTENT_LENGTH);
+      });
 
       console.error(`✅ Content extraction completed. Length: ${content.length} characters`);
-      await articlePage.close();
+      if (content.length > MAX_CONTENT_LENGTH) {
+        return `${content.slice(0, MAX_CONTENT_LENGTH)}\n\n[TRUNCATED: ${MAX_CONTENT_LENGTH} of ${content.length} characters; adjust MEDIUM_MAX_CONTENT_LENGTH to retrieve more.]`;
+      }
       return content;
       
     } catch (error) {
       console.error('❌ Error fetching article content:', error);
       throw new Error(`Failed to fetch article content: ${error}`);
+    } finally {
+      await articlePage.close();
     }
   }
 
@@ -447,8 +446,8 @@ export class BrowserMediumClient {
 
     try {
       // Navigate to the new story page
-      await this.page.goto('https://medium.com/new-story', { waitUntil: 'domcontentloaded' });
-      await this.page.waitForTimeout(3000);
+      await this.page.goto('https://medium.com/new-story');
+      await this.page.waitForLoadState('networkidle');
 
       // Wait for the editor to load
       await this.page.waitForSelector('[data-testid="richTextEditor"]', { timeout: 10000 });
@@ -505,7 +504,7 @@ export class BrowserMediumClient {
           await finalPublishButton.click();
           
           // Wait for success and get URL
-          await this.page.waitForTimeout(5000);
+          await this.page.waitForLoadState('networkidle');
           const currentUrl = this.page.url();
           
           return { success: true, url: currentUrl };
@@ -707,21 +706,13 @@ export class BrowserMediumClient {
                 if (t && datePattern.test(t)) { dateText = t; break; }
               }
 
-              // Extract claps: first numeric span that isn't the date/response
-              const numPattern = /^\d+$/;
-              let claps = 0;
-              for (const sp of dateSpans) {
-                const t = sp.textContent?.trim();
-                if (t && numPattern.test(t) && parseInt(t) > 2) { claps = parseInt(t); break; }
-              }
-
               log(`📝 Article ${index + 1}:`, {
                 title: titleText,
                 url: linkUrl,
                 author: authorText,
                 snippet: snippetText.substring(0, 50) + '...',
                 date: dateText,
-                claps,
+                claps: null,
               });
 
               if (titleText && linkUrl) {
@@ -731,7 +722,7 @@ export class BrowserMediumClient {
                   url: linkUrl,
                   publishDate: dateText,
                   tags: [],
-                  claps,
+                  claps: null,
                 });
               }
             } catch (error) {
@@ -780,6 +771,7 @@ export class BrowserMediumClient {
   }
 
   async close(): Promise<void> {
+    await this.initialization?.catch(() => {});
     if (this.browser) {
       await this.browser.close();
       this.browser = null;

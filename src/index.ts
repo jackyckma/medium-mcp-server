@@ -201,22 +201,8 @@ class MediumMcpServer {
     );
   }
 
-  // Method to start the server
-  // Le navigateur est lance PARESSEUSEMENT, a la premiere utilisation d un
-  // outil — plus au demarrage du serveur.
-  //
-  // Avant : chaque instance MCP lancait un Chromium Playwright sous Xvfb des
-  // son demarrage, meme si aucun outil n etait jamais appele. Constate le
-  // 2026-08-28 : 8 serveurs inactifs = 32 processus chrome + 6 Xvfb, dont
-  // certains vieux de 6 h. Cumule, cela avait sature dbus
-  // (max_connections_per_user=256) au point de rendre systemctl inutilisable.
-  private browserReady = false;
-
   private async ensureBrowser(): Promise<void> {
-    if (this.browserReady) return;
     await this.mediumClient.initialize();
-    this.browserReady = true;
-    console.error("🌐 Browser Medium client initialized (lazy)");
   }
 
   async start() {
@@ -232,8 +218,6 @@ class MediumMcpServer {
 
   // Cleanup method
   async cleanup() {
-    // Rien a fermer si le navigateur n a jamais ete lance (mode paresseux).
-    if (!this.browserReady) return;
     await this.mediumClient.close();
   }
 }
