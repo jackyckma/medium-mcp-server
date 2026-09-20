@@ -25,7 +25,7 @@ function harness({ fail, document } = {}) {
     },
     async evaluate(fn, arg) {
       if (fail === 'extraction') throw Error('extraction');
-      return vm.runInNewContext(`(${fn.toString()})(arg)`, { document, arg, window: { scrollBy() {}, innerHeight: 900 } });
+      return vm.runInNewContext(`(${fn.toString()})(arg)`, { document, arg, URL, window: { scrollBy() {}, innerHeight: 900 } });
     },
     async close() { state.tabsClosed++; },
     url() { return 'https://medium.com/search'; }
@@ -254,3 +254,58 @@ test('navigation stays restricted to Medium HTTPS hosts regardless of environmen
   });
   assert.equal(result.status, 0, result.stderr);
 });
+
+const destination = 'https://medium.com/@author/story-abcdef123456';
+const redirectLink = '/m/signin?redirect=' + encodeURIComponent(destination + '?source=search');
+for (const strategy of ['title', 'heading', 'slug', 'data-href']) {
+  test(`search decodes article redirects through ${strategy} candidates`, async () => {
+    const anchor = { href: redirectLink };
+    const title = { textContent: 'Redirected story', closest: () => strategy === 'title' ? anchor : null };
+    const article = {
+      querySelector(selector) {
+        if (selector === 'h2') return title;
+        if (selector === 'a:has(h2), a:has(h3)' && strategy === 'heading') return anchor;
+        if (selector === '[data-href]' && strategy === 'data-href') return { getAttribute: () => redirectLink };
+        return null;
+      },
+      querySelectorAll: selector => selector === 'a' && strategy === 'slug' ? [anchor] : []
+    };
+    harness({ document: { body: { textContent: 'Search results' }, querySelectorAll: selector => selector === 'article' ? [article] : [] } });
+    const client = new BrowserMediumClient();
+    await client.initialize();
+    const articles = await client.searchMediumArticles(['redirected']);
+    assert.equal(articles.length, 1);
+    assert.equal(articles[0].url, destination);
+    await client.close();
+  });
+}
+
+for (const candidate of [
+  'https://medium.com/m/signin',
+  'https://medium.com/m/signup?source=search',
+  'https://medium.com/m/signin?redirect=' + encodeURIComponent('https://example.net/story-abcdef123456'),
+  'https://medium.com/m/signin?redirect=' + encodeURIComponent('https://medium.com.example.net/story-abcdef123456'),
+  'https://medium.com/m/signin?redirect=' + encodeURIComponent('javascript:alert(1)'),
+  'https://medium.com/m/signin?redirect=' + encodeURIComponent('https://user:password@medium.com/story-abcdef123456'),
+  'https://medium.com/m/signin?redirect=' + encodeURIComponent('https://medium.com/m/signin?redirect=' + encodeURIComponent(destination)),
+  'https://example.net/signin?redirect=' + encodeURIComponent(destination),
+  'https://medium.com/m/signin?redirect=https%3A%2F%2F%5B'
+]) {
+  test(`search rejects invalid candidate and continues to article fallback: ${candidate}`, async () => {
+    const title = { textContent: 'Public story', closest: () => ({ href: candidate }) };
+    let fallback = false;
+    const article = {
+      querySelector: selector => selector === 'h2' ? title : null,
+      querySelectorAll: selector => selector === 'a' && fallback ? [{ href: candidate }, { href: destination }] : []
+    };
+    harness({ document: { body: { textContent: 'Search results' }, querySelectorAll: selector => selector === 'article' ? [article] : [] } });
+    const client = new BrowserMediumClient();
+    await client.initialize();
+    assert.equal((await client.searchMediumArticles(['public'])).length, 0);
+    fallback = true;
+    const articles = await client.searchMediumArticles(['public']);
+    assert.equal(articles.length, 1);
+    assert.equal(articles[0].url, destination);
+    await client.close();
+  });
+}

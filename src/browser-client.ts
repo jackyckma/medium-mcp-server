@@ -577,6 +577,24 @@ export class BrowserMediumClient {
         '.post-preview'
       ];
 
+      const articleUrl = (raw: string): string => {
+        try {
+          const valid = (url: URL) => url.protocol === 'https:' &&
+            (url.hostname === 'medium.com' || url.hostname.endsWith('.medium.com')) &&
+            !url.username && !url.password && !url.port;
+          let url = new URL(raw, 'https://medium.com');
+          if (!valid(url)) return '';
+          const redirect = url.searchParams.get('redirect');
+          if (redirect) url = new URL(redirect, url.origin);
+          if (!valid(url) || /(?:^|\/)(?:signin|signup)(?:\/|$)/i.test(url.pathname)) return '';
+          url.search = '';
+          url.hash = '';
+          return url.href;
+        } catch {
+          return '';
+        }
+      };
+
       const articles: any[] = [];
       let elementsFound = 0;
 
@@ -618,7 +636,7 @@ export class BrowserMediumClient {
               if (titleElement && (titleElement as HTMLElement).closest) {
                 const titleAnchor = (titleElement as HTMLElement).closest('a');
                 if (titleAnchor && (titleAnchor as HTMLAnchorElement).href) {
-                  linkUrl = (titleAnchor as HTMLAnchorElement).href.split('?')[0];
+                  linkUrl = articleUrl((titleAnchor as HTMLAnchorElement).href);
                 }
               }
 
@@ -626,7 +644,7 @@ export class BrowserMediumClient {
               if (!linkUrl) {
                 const titleLink = element.querySelector('a:has(h2), a:has(h3)');
                 if (titleLink && (titleLink as HTMLAnchorElement).href) {
-                  linkUrl = (titleLink as HTMLAnchorElement).href.split('?')[0];
+                  linkUrl = articleUrl((titleLink as HTMLAnchorElement).href);
                 }
               }
 
@@ -634,12 +652,12 @@ export class BrowserMediumClient {
               // Medium article IDs are 12 hex chars; publi/author/profile links never have this.
               if (!linkUrl) {
                 const allLinks = Array.from(element.querySelectorAll('a'));
-                const slugLink = allLinks.find(a => {
-                  const h = (a as HTMLAnchorElement).href;
-                  return h && !h.includes('/signin') && !h.includes('/signup') && /-[a-f0-9]{8,}$/.test(h.split('?')[0]);
-                });
-                if (slugLink) {
-                  linkUrl = (slugLink as HTMLAnchorElement).href.split('?')[0];
+                for (const anchor of allLinks) {
+                  const candidate = articleUrl((anchor as HTMLAnchorElement).href);
+                  if (candidate && /-[a-f0-9]{8,}$/.test(new URL(candidate).pathname)) {
+                    linkUrl = candidate;
+                    break;
+                  }
                 }
               }
 
@@ -649,7 +667,7 @@ export class BrowserMediumClient {
                 if (dataHrefElement) {
                   const dataHref = dataHrefElement.getAttribute('data-href');
                   if (dataHref) {
-                    linkUrl = dataHref.startsWith('/') ? 'https://medium.com' + dataHref : dataHref.split('?')[0];
+                    linkUrl = articleUrl(dataHref);
                   }
                 }
               }
