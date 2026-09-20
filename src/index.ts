@@ -37,6 +37,7 @@ class MediumMcpServer {
       },
       async (args) => {
         try {
+          await this.ensureBrowser();
           const publishResult = await this.mediumClient.publishArticle({
             title: args.title,
             content: args.content,
@@ -73,6 +74,7 @@ class MediumMcpServer {
       {},
       async () => {
         try {
+          await this.ensureBrowser();
           const articles = await this.mediumClient.getUserArticles();
 
           return {
@@ -107,6 +109,7 @@ class MediumMcpServer {
       },
       async (args) => {
         try {
+          await this.ensureBrowser();
           const content = await this.mediumClient.getArticleContent(args.url, args.requireLogin);
 
           return {
@@ -140,6 +143,7 @@ class MediumMcpServer {
       },
       async (args) => {
         try {
+          await this.ensureBrowser();
           const articles = await this.mediumClient.searchMediumArticles(args.keywords);
 
           return {
@@ -171,6 +175,7 @@ class MediumMcpServer {
       {},
       async () => {
         try {
+          await this.ensureBrowser();
           const success = await this.mediumClient.ensureLoggedIn();
           
           return {
@@ -197,12 +202,25 @@ class MediumMcpServer {
   }
 
   // Method to start the server
+  // Le navigateur est lance PARESSEUSEMENT, a la premiere utilisation d un
+  // outil — plus au demarrage du serveur.
+  //
+  // Avant : chaque instance MCP lancait un Chromium Playwright sous Xvfb des
+  // son demarrage, meme si aucun outil n etait jamais appele. Constate le
+  // 2026-08-28 : 8 serveurs inactifs = 32 processus chrome + 6 Xvfb, dont
+  // certains vieux de 6 h. Cumule, cela avait sature dbus
+  // (max_connections_per_user=256) au point de rendre systemctl inutilisable.
+  private browserReady = false;
+
+  private async ensureBrowser(): Promise<void> {
+    if (this.browserReady) return;
+    await this.mediumClient.initialize();
+    this.browserReady = true;
+    console.error("🌐 Browser Medium client initialized (lazy)");
+  }
+
   async start() {
     try {
-      // Initialize browser client
-      await this.mediumClient.initialize();
-      console.error("🌐 Browser Medium client initialized");
-
       const transport = new StdioServerTransport();
       await this.server.connect(transport);
       console.error("🚀 Medium MCP Server (Browser-based) Initialized");
@@ -214,6 +232,8 @@ class MediumMcpServer {
 
   // Cleanup method
   async cleanup() {
+    // Rien a fermer si le navigateur n a jamais ete lance (mode paresseux).
+    if (!this.browserReady) return;
     await this.mediumClient.close();
   }
 }
@@ -222,18 +242,36 @@ class MediumMcpServer {
 async function main() {
   const server = new MediumMcpServer();
   
-  // Handle graceful shutdown
-  process.on('SIGINT', async () => {
-    console.error("🛑 Shutting down Medium MCP Server...");
-    await server.cleanup();
+  // Handle graceful shutdown.
+  //
+  // Le transport MCP est du stdio : quand le client disparaît, il ne signale
+  // rien — il ferme simplement le pipe. Sans garde sur EOF, ce serveur et son
+  // navigateur Playwright sous Xvfb survivaient indéfiniment. Constaté le
+  // 2026-08-28 : 324 chrome, 37 Xvfb et 58 processus node orphelins, dont
+  // certains vieux de 3 jours, saturant dbus (max_connections_per_user=256)
+  // au point de rendre systemctl inutilisable.
+  let shuttingDown = false;
+  const shutdown = async (reason: string) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.error(`🛑 Shutting down Medium MCP Server (${reason})...`);
+    try {
+      await server.cleanup();
+    } catch (e) {
+      console.error("cleanup failed:", e);
+    }
     process.exit(0);
-  });
+  };
 
-  process.on('SIGTERM', async () => {
-    console.error("🛑 Shutting down Medium MCP Server...");
-    await server.cleanup();
-    process.exit(0);
-  });
+  process.on('SIGINT', () => { void shutdown('SIGINT'); });
+  process.on('SIGTERM', () => { void shutdown('SIGTERM'); });
+  process.on('SIGHUP', () => { void shutdown('SIGHUP'); });
+
+  // Le client MCP a fermé le pipe : plus personne n'écoute, on ferme le
+  // navigateur au lieu de le laisser orphelin.
+  process.stdin.on('end', () => { void shutdown('stdin end'); });
+  process.stdin.on('close', () => { void shutdown('stdin close'); });
+  process.stdin.on('error', () => { void shutdown('stdin error'); });
 
   await server.start();
 }

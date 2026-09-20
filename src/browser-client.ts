@@ -1,6 +1,35 @@
 import { chromium, Browser, Page, BrowserContext } from 'playwright';
-import { writeFileSync, readFileSync, existsSync } from 'fs';
+import { writeFileSync, readFileSync, existsSync, mkdirSync, chmodSync } from 'fs';
 import { join } from 'path';
+import { homedir } from 'os';
+
+// Configurable via environment
+const HEADLESS = process.env.MEDIUM_HEADLESS === '1' || process.env.MEDIUM_HEADLESS === 'true';
+const MAX_CONTENT_LENGTH = parseInt(process.env.MEDIUM_MAX_CONTENT_LENGTH || '50000', 10);
+const SESSION_DIR = process.env.MEDIUM_SESSION_DIR || join(homedir(), '.medium-mcp');
+const ALLOWED_HOSTS = (process.env.MEDIUM_ALLOWED_HOSTS || 'medium.com')
+  .split(',').map(h => h.trim().toLowerCase()).filter(Boolean);
+
+function defaultUserAgent(): string {
+  const platform = process.platform;
+  if (platform === 'win32') {
+    return 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+  }
+  if (platform === 'darwin') {
+    return 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+  }
+  return 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+}
+
+function isAllowedMediumUrl(raw: string): boolean {
+  try {
+    const u = new URL(raw);
+    const host = u.hostname.toLowerCase();
+    return ALLOWED_HOSTS.some(h => host === h || host.endsWith('.' + h));
+  } catch {
+    return false;
+  }
+}
 
 export interface MediumArticle {
   title: string;
@@ -22,31 +51,31 @@ export class BrowserMediumClient {
   private browser: Browser | null = null;
   private context: BrowserContext | null = null;
   private page: Page | null = null;
-  private sessionPath = join(process.cwd(), 'medium-session.json');
+  private sessionPath = join(SESSION_DIR, 'medium-session.json');
+  private profileDir = join(SESSION_DIR, 'chrome-profile');
 
   async initialize(): Promise<void> {
-    this.browser = await chromium.launch({ 
-      headless: false, // Keep visible for login
-      slowMo: 100, // Slow down for reliability
+    if (!existsSync(SESSION_DIR)) {
+      mkdirSync(SESSION_DIR, { recursive: true, mode: 0o700 });
+    }
+
+    this.browser = await chromium.launch({
+      headless: HEADLESS,
       args: [
         '--no-first-run',
         '--no-default-browser-check',
         '--disable-blink-features=AutomationControlled',
         '--disable-features=VizDisplayCompositor',
-        '--disable-web-security',
         '--disable-features=TranslateUI',
         '--disable-ipc-flooding-protection',
-        '--user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        '--disable-dev-shm-usage',
+        `--user-agent=${defaultUserAgent()}`
       ]
     });
 
-    // Load existing session if available
     const contextOptions: any = {
-      viewport: { width: 1280, height: 720 },
-      userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      extraHTTPHeaders: {
-        'Accept-Language': 'en-US,en;q=0.9'
-      }
+      viewport: { width: 1280, height: 900 },
+      userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
     };
 
     if (existsSync(this.sessionPath)) {
@@ -59,33 +88,31 @@ export class BrowserMediumClient {
     }
 
     this.context = await this.browser.newContext(contextOptions);
-    
-    // Add script to remove webdriver property
+
     await this.context.addInitScript(() => {
       Object.defineProperty(navigator, 'webdriver', {
         get: () => undefined,
       });
-      
-      // Remove automation indicators
       delete (window as any).cdc_adoQpoasnfa76pfcZLmcfl_Array;
       delete (window as any).cdc_adoQpoasnfa76pfcZLmcfl_Promise;
       delete (window as any).cdc_adoQpoasnfa76pfcZLmcfl_Symbol;
     });
-    
+
     this.page = await this.context.newPage();
   }
 
   async ensureLoggedIn(): Promise<boolean> {
     if (!this.page) throw new Error('Browser not initialized');
 
-    // First check if we have a saved session
+    // If we have a saved session, trust it — don't trigger interactive login
     if (existsSync(this.sessionPath)) {
-      console.error('💾 Found existing session file, testing login status...');
+      console.error('💾 Found existing session file, trusting it (no interactive login)');
+      return true;
     }
 
-    // Try a simpler page first to check login status
-    await this.page.goto('https://medium.com');
-    await this.page.waitForLoadState('networkidle');
+    // No saved session — navigate to Medium and check login status
+    await this.page.goto('https://medium.com', { waitUntil: 'domcontentloaded' });
+    await this.page.waitForTimeout(3000);
     
     // Check if we're logged in by looking for user-specific elements
     try {
@@ -157,7 +184,8 @@ export class BrowserMediumClient {
     
     try {
       const sessionData = await this.context.storageState();
-      writeFileSync(this.sessionPath, JSON.stringify(sessionData, null, 2));
+      writeFileSync(this.sessionPath, JSON.stringify(sessionData, null, 2), { mode: 0o600 });
+      chmodSync(this.sessionPath, 0o600);
       console.error('💾 Session saved for future use');
     } catch (error) {
       console.error('Failed to save session:', error);
@@ -170,8 +198,8 @@ export class BrowserMediumClient {
     await this.ensureLoggedIn();
     
     // Navigate to user's stories
-    await this.page.goto('https://medium.com/me/stories/public');
-    await this.page.waitForLoadState('networkidle');
+    await this.page.goto('https://medium.com/me/stories/public', { waitUntil: 'domcontentloaded' });
+    await this.page.waitForTimeout(3000);
 
     // Extract article information
     const articles = await this.page.evaluate(() => {
@@ -205,66 +233,56 @@ export class BrowserMediumClient {
   }
 
   async getArticleContent(url: string, requireLogin: boolean = true): Promise<string> {
-    if (!this.page) throw new Error('Browser not initialized');
+    if (!this.page || !this.context) throw new Error('Browser not initialized');
+
+    if (!isAllowedMediumUrl(url)) {
+      throw new Error(`Refusing to navigate to non-Medium URL: ${url}. Allowed hosts: ${ALLOWED_HOSTS.join(', ')}. Extend via MEDIUM_ALLOWED_HOSTS env.`);
+    }
     
     console.error(`📖 Fetching article content from: ${url}`);
     
-    // Check if we have a saved session first
-    let isLoggedIn = false;
+    // Trust saved session if it exists — don't do a separate homepage navigation
+    // (the homepage→article double navigation triggers extra Cloudflare challenges)
     if (existsSync(this.sessionPath)) {
-      console.error('💾 Found saved session, checking if still valid...');
-      
-      // Quick check: try to access Medium homepage and look for login indicators
-      try {
-        await this.page.goto('https://medium.com');
-        await this.page.waitForLoadState('networkidle');
-        
-        // Try to find login indicators quickly
-        const loginIndicators = [
-          '[data-testid="headerUserButton"]',
-          '[data-testid="write-button"]',
-          'a[href="/me/stories"]'
-        ];
-        
-        for (const selector of loginIndicators) {
-          try {
-            await this.page.waitForSelector(selector, { timeout: 2000 });
-            console.error('✅ Session is still valid, user is logged in');
-            isLoggedIn = true;
-            break;
-          } catch {
-            // Try next selector
-          }
-        }
-      } catch (error) {
-        console.error('⚠️  Could not verify session validity');
-      }
-    }
-    
-    if (!isLoggedIn && requireLogin) {
-      console.error('🔐 Not logged in. Attempting login for full content access...');
-      isLoggedIn = await this.ensureLoggedIn();
-    } else if (!isLoggedIn && !requireLogin) {
-      console.error('🔓 Skipping login as requested. Will get preview content only.');
-    }
-    
-    if (!isLoggedIn) {
-      console.error('⚠️  Warning: Login failed or skipped. You may only get partial content (preview).');
+      console.error('💾 Using saved session for article fetch');
+    } else if (requireLogin) {
+      console.error('🔐 No saved session. Attempting login for full content access...');
+      await this.ensureLoggedIn();
     } else {
-      console.error('✅ Ready to fetch full article content with login session');
+      console.error('🔓 No session, will get preview content only.');
     }
     
     try {
-      console.error(`🌐 Navigating to article: ${url}`);
-      await this.page.goto(url, { waitUntil: 'networkidle' });
-      
-      // Wait a bit more for dynamic content
-      await this.page.waitForTimeout(3000);
+      // Use a fresh page (new tab) to avoid navigation history triggering Cloudflare
+      const articlePage = await this.context.newPage();
+      console.error(`🌐 Navigating to article (new tab): ${url}`);
+      await articlePage.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+
+      // Wait for Cloudflare challenge to resolve, then for real article content.
+      // Poll: check if page is on Cloudflare challenge, wait until it clears.
+      let cfCleared = false;
+      for (let attempt = 0; attempt < 15; attempt++) {
+        await articlePage.waitForTimeout(2000);
+        const state = await articlePage.evaluate(() => ({
+          isCF: document.title === 'Just a moment...' ||
+                document.body?.innerText?.includes('security verification') ||
+                document.body?.innerText?.includes('Enable JavaScript and cookies'),
+          hasArticle: document.querySelectorAll('article p, article section p').length > 3,
+          title: document.querySelector('article h1')?.textContent?.trim()?.substring(0, 40),
+        })).catch(() => ({ isCF: false, hasArticle: false }));
+        if (state.hasArticle) { cfCleared = true; break; }
+        if (state.isCF && attempt === 0) console.error('⏳ Cloudflare challenge detected, waiting...');
+        if (!state.isCF && !state.hasArticle && attempt > 3) {
+          console.error('⚠️ No Cloudflare but no article content either');
+          break;
+        }
+      }
+      if (!cfCleared) console.error('⚠️ Could not load article content (Cloudflare or paywall)');
       
       console.error('📄 Page loaded, extracting content...');
 
       // Extract article content with multiple strategies
-      const content = await this.page.evaluate(() => {
+      const content = await articlePage.evaluate((maxLen: number) => {
         const log = (...args: any[]) => {
           // Silent in browser context to avoid JSON interference
         };
@@ -343,7 +361,7 @@ export class BrowserMediumClient {
                 extractedContent = text
                   .replace(/\s+/g, ' ') // Normalize whitespace
                   .replace(/(.{100})/g, '$1\n\n') // Add paragraph breaks
-                  .substring(0, 5000); // Limit length
+                  .substring(0, maxLen); // Limit length
                 
                 log(`✅ Fallback extraction successful using: ${selector}`);
                 break;
@@ -410,9 +428,10 @@ export class BrowserMediumClient {
         
         log(`📊 Final content length: ${extractedContent.length} characters`);
         return extractedContent;
-      });
+      }, MAX_CONTENT_LENGTH);
 
       console.error(`✅ Content extraction completed. Length: ${content.length} characters`);
+      await articlePage.close();
       return content;
       
     } catch (error) {
@@ -428,8 +447,8 @@ export class BrowserMediumClient {
 
     try {
       // Navigate to the new story page
-      await this.page.goto('https://medium.com/new-story');
-      await this.page.waitForLoadState('networkidle');
+      await this.page.goto('https://medium.com/new-story', { waitUntil: 'domcontentloaded' });
+      await this.page.waitForTimeout(3000);
 
       // Wait for the editor to load
       await this.page.waitForSelector('[data-testid="richTextEditor"]', { timeout: 10000 });
@@ -486,7 +505,7 @@ export class BrowserMediumClient {
           await finalPublishButton.click();
           
           // Wait for success and get URL
-          await this.page.waitForLoadState('networkidle');
+          await this.page.waitForTimeout(5000);
           const currentUrl = this.page.url();
           
           return { success: true, url: currentUrl };
@@ -511,13 +530,33 @@ export class BrowserMediumClient {
       console.error('💾 Using saved session for search...');
     }
     
-    await this.page.goto(`https://medium.com/search?q=${encodeURIComponent(searchQuery)}`);
-    await this.page.waitForLoadState('networkidle');
-    
-    // Wait a bit more for dynamic content to load
-    await this.page.waitForTimeout(2000);
+    await this.page.goto(`https://medium.com/search?q=${encodeURIComponent(searchQuery)}`, {
+      waitUntil: 'domcontentloaded',
+      timeout: 30000,
+    });
+
+    // Wait for content to render (Cloudflare challenge may add delay)
+    try {
+      await this.page.waitForSelector('article', { timeout: 15000 });
+    } catch {
+      // Cloudflare or slow render — give it more time
+      console.error('⏳ No articles yet, waiting for Cloudflare/render...');
+      await this.page.waitForTimeout(5000);
+    }
 
     console.error('📄 Current page URL:', this.page.url());
+
+    // Scroll to load more results (lazy-loaded feed)
+    const maxScrolls = 5;
+    let prevCount = 0;
+    for (let s = 0; s < maxScrolls; s++) {
+      await this.page.evaluate(() => window.scrollBy(0, window.innerHeight));
+      await this.page.waitForTimeout(1500);
+      const count = await this.page.evaluate(() => document.querySelectorAll('article').length);
+      console.error(`📉 Scroll ${s + 1}/${maxScrolls}: ${count} articles loaded`);
+      if (count === prevCount) break; // No new content, stop scrolling
+      prevCount = count;
+    }
 
     const articles = await this.page.evaluate((searchQuery) => {
       // Remove console.log from browser context to avoid JSON interference
@@ -578,116 +617,111 @@ export class BrowserMediumClient {
 
               // Try multiple approaches to find the actual article URL
               let linkUrl = '';
-              
-              // Strategy 1: Look for data-href attribute (most reliable for articles)
-              const dataHrefElement = element.querySelector('[data-href]');
-              if (dataHrefElement) {
-                const dataHref = dataHrefElement.getAttribute('data-href');
-                if (dataHref && dataHref.includes('medium.com') && dataHref.includes('-')) {
-                  linkUrl = dataHref;
+
+              // Strategy 1 (BEST): The <a> wrapping the title element is the article link.
+              // This is the canonical Medium title-link pattern — stable across layouts.
+              if (titleElement && (titleElement as HTMLElement).closest) {
+                const titleAnchor = (titleElement as HTMLElement).closest('a');
+                if (titleAnchor && (titleAnchor as HTMLAnchorElement).href) {
+                  linkUrl = (titleAnchor as HTMLAnchorElement).href.split('?')[0];
                 }
               }
-              
-              // Strategy 2: Look for direct article links if data-href didn't work
-              if (!linkUrl) {
-                const linkSelectors = [
-                  'a[href*="medium.com"][href*="-"]', // Article URLs usually have dashes
-                  'a[href*="/@"][href*="-"]',         // Author articles with dashes
-                  'a[href*="medium.com"]',
-                  'a[href*="/"]',
-                  'a'
-                ];
 
-                                  for (const linkSel of linkSelectors) {
-                    const linkElement = element.querySelector(linkSel);
-                    if (linkElement && (linkElement as HTMLAnchorElement).href) {
-                      let href = (linkElement as HTMLAnchorElement).href;
-                      
-                      // Clean up and validate the URL
-                      if (href) {
-                        // If it's a redirect URL, extract the actual article URL
-                        if (href.includes('redirect=')) {
-                          const redirectMatch = href.match(/redirect=([^&]+)/);
-                          if (redirectMatch) {
-                            href = decodeURIComponent(redirectMatch[1]);
-                          }
-                        }
-                        
-                        // Check if it's a valid article URL (prioritize actual articles)
-                        const isValidArticleUrl = (
-                          href.includes('medium.com') && 
-                          !href.includes('/search?') &&  // Don't include search pages themselves
-                          !href.includes('/signin') &&
-                          !href.includes('/bookmark') &&
-                          !href.includes('/signup') &&
-                          // Prioritize URLs that look like actual articles
-                          (href.includes('-') ||  // Article slugs usually have dashes
-                           href.includes('/@') || 
-                           href.match(/\/[a-f0-9]{8,}/))  // Article IDs (8+ chars)
-                        );
-                        
-                        if (isValidArticleUrl) {
-                          // Clean the URL but preserve the path
-                          if (href.includes('?')) {
-                            // Extract the actual article URL from redirect parameters
-                            if (href.includes('redirect=')) {
-                              const redirectMatch = href.match(/redirect=([^&]+)/);
-                              if (redirectMatch) {
-                                linkUrl = decodeURIComponent(redirectMatch[1]);
-                              }
-                            } else {
-                              // Just remove query parameters for cleaner URLs
-                              linkUrl = href.split('?')[0];
-                            }
-                          } else {
-                            linkUrl = href;
-                          }
-                          break;
-                        }
-                      }
-                    }
+              // Strategy 2: Any <a> containing an h2/h3 (title link without closest support)
+              if (!linkUrl) {
+                const titleLink = element.querySelector('a:has(h2), a:has(h3)');
+                if (titleLink && (titleLink as HTMLAnchorElement).href) {
+                  linkUrl = (titleLink as HTMLAnchorElement).href.split('?')[0];
+                }
+              }
+
+              // Strategy 3: Find a link whose path ends with a hex article ID (slug-xxxxxxxxxxxx)
+              // Medium article IDs are 12 hex chars; publi/author/profile links never have this.
+              if (!linkUrl) {
+                const allLinks = Array.from(element.querySelectorAll('a'));
+                const slugLink = allLinks.find(a => {
+                  const h = (a as HTMLAnchorElement).href;
+                  return h && !h.includes('/signin') && !h.includes('/signup') && /-[a-f0-9]{8,}$/.test(h.split('?')[0]);
+                });
+                if (slugLink) {
+                  linkUrl = (slugLink as HTMLAnchorElement).href.split('?')[0];
+                }
+              }
+
+              // Strategy 4 (fallback): data-href attribute
+              if (!linkUrl) {
+                const dataHrefElement = element.querySelector('[data-href]');
+                if (dataHrefElement) {
+                  const dataHref = dataHrefElement.getAttribute('data-href');
+                  if (dataHref) {
+                    linkUrl = dataHref.startsWith('/') ? 'https://medium.com' + dataHref : dataHref.split('?')[0];
                   }
                 }
+              }
 
               // Try to get author info
               const authorSelectors = [
                 '[data-testid="story-author"]',
                 '.postMetaInline-authorLockup',
                 '.story-author',
-                '.author-name'
+                '.author-name',
+                'a[href*="/@"]',  // Author profile link on modern Medium
               ];
 
               let authorText = '';
               for (const authorSel of authorSelectors) {
                 const authorElement = element.querySelector(authorSel);
                 if (authorElement && authorElement.textContent?.trim()) {
-                  authorText = authorElement.textContent.trim();
-                  break;
+                  // For /@username links, extract the display name (not the URL)
+                  const text = authorElement.textContent.trim();
+                  if (text.length > 1 && text.length < 100) {
+                    authorText = text;
+                    break;
+                  }
                 }
               }
 
-              // Try to get snippet/preview
+              // Try to get snippet/preview (subtitle on modern Medium is h3, after the h2 title)
               const snippetSelectors = [
+                'h3',                   // Subtitle/preview on modern Medium search
                 '.story-excerpt',
                 '.post-excerpt',
                 '.graf--p',
-                'p'
               ];
 
               let snippetText = '';
               for (const snippetSel of snippetSelectors) {
                 const snippetElement = element.querySelector(snippetSel);
-                if (snippetElement && snippetElement.textContent?.trim()) {
+                if (snippetElement && snippetElement.textContent?.trim() && snippetElement !== titleElement) {
                   snippetText = snippetElement.textContent.trim().substring(0, 200);
                   break;
                 }
+              }
+
+              // Extract date from spans matching common date patterns
+              const dateSpans = Array.from(element.querySelectorAll('span'));
+              const datePattern = /^(Today|Yesterday|\d{1,2}\s*(d|hr|h)\s*ago|(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*\s+\d{1,2})$/i;
+              let dateText = '';
+              for (const sp of dateSpans) {
+                const t = sp.textContent?.trim();
+                if (t && datePattern.test(t)) { dateText = t; break; }
+              }
+
+              // Extract claps: first numeric span that isn't the date/response
+              const numPattern = /^\d+$/;
+              let claps = 0;
+              for (const sp of dateSpans) {
+                const t = sp.textContent?.trim();
+                if (t && numPattern.test(t) && parseInt(t) > 2) { claps = parseInt(t); break; }
               }
 
               log(`📝 Article ${index + 1}:`, {
                 title: titleText,
                 url: linkUrl,
                 author: authorText,
-                snippet: snippetText.substring(0, 50) + '...'
+                snippet: snippetText.substring(0, 50) + '...',
+                date: dateText,
+                claps,
               });
 
               if (titleText && linkUrl) {
@@ -695,9 +729,9 @@ export class BrowserMediumClient {
                   title: titleText,
                   content: snippetText,
                   url: linkUrl,
-                  publishDate: '',
+                  publishDate: dateText,
                   tags: [],
-                  claps: 0
+                  claps,
                 });
               }
             } catch (error) {
