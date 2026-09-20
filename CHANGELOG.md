@@ -21,8 +21,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `login-to-medium` - Manual login trigger for session management
 
 ### Features
-- **Session persistence** - Login once, use everywhere via `medium-session.json`
-- **Headless operation** - Runs without UI after initial login
+- **Session persistence** - See [Session Management](README.md#session-management) for scope and reuse
+- **Browser mode** - See [Configuration](README.md#configuration) for current behavior
 - **Anti-detection measures** - Realistic browser automation to avoid blocking
 - **Multiple login methods** - Support for email/password and Google login
 - **Robust content extraction** - Handles both preview and full article content
@@ -95,7 +95,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 1. Remove old `.env` API configurations
 2. Install Playwright: `npx playwright install chromium`
 3. Update Claude MCP configuration
-4. Run initial login: `npm start` and complete browser login
+4. Follow [First Time Setup](README.md#first-time-setup) for browser login
 5. Test functionality with new browser-based tools
 
 **Benefits of Migration**:

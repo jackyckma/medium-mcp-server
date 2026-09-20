@@ -8,7 +8,7 @@ Medium stopped issuing new API tokens in 2023, making traditional API integratio
 - ✅ **Work without API tokens** - Uses your existing Medium login session
 - ✅ **Full functionality** - Publish, search, and manage your Medium content
 - ✅ **Secure** - Saves your login session locally for reuse
-- ✅ **Interactive** - Opens browser for initial login, then runs headlessly
+- ✅ **Browser mode** - See [Configuration](#configuration) for display and login settings
 
 ## 📖 Deep Dive Article
 Want to understand the full story behind Medium MCP? Check out the comprehensive article:
@@ -20,7 +20,7 @@ Want to understand the full story behind Medium MCP? Check out the comprehensive
 - 📝 **Article publishing** with title, content, and tags
 - 📚 **Retrieve your articles** from your Medium profile
 - 🔍 **Search Medium articles** by keywords
-- 💾 **Session persistence** - login once, use everywhere
+- 💾 **Session persistence** - See [Session Management](#session-management)
 - 🎯 **Claude integration** via Model Context Protocol
 
 ## Technology Stack
@@ -34,7 +34,7 @@ Want to understand the full story behind Medium MCP? Check out the comprehensive
 ### Prerequisites
 - Node.js (v16 or later)
 - npm or yarn
-- A Medium account (no API credentials needed!)
+- A Medium account for account-specific operations; public search and reading can run anonymously
 
 ### Installation
 ```bash
@@ -55,20 +55,31 @@ npm run build
 ```
 
 ### Configuration
-No API keys needed! The server will prompt you to login to Medium in your browser on first use.
+No API keys are needed. Optional browser settings are loaded from the process environment or `.env` in the working directory before browser configuration is evaluated. See [.env.example](.env.example) for a copyable example; restart the server after changing settings.
+
+`MEDIUM_HEADLESS` enables operation without a display only when set to `1` or `true`. Otherwise Chromium uses a display. Manual login requires an accessible browser window; without a display, an unsuccessful login check returns failure and public article reading can still proceed.
+
+`MEDIUM_MAX_CONTENT_LENGTH` limits extracted text on both the main and fallback paths. Its default is 50000 JavaScript string units; invalid, nonpositive or unsafe integer values use that default. Longer results include a `[TRUNCATED: ...]` notice after the retained text. Increase the setting and restart to retrieve more.
 
 ### Usage
 
 #### Test the Browser Client
-```bash
-# Test the browser automation (optional)
-node test-browser.js
-```
+See [Testing](CONTRIBUTING.md#testing) for the maintained checks and their prerequisites.
 
 #### Start the MCP Server
 ```bash
 npm start
 ```
+
+The server connects MCP before launching Chromium. The first tool invocation starts the browser, and concurrent initialization requests share that startup. Protocol messages use standard output; diagnostics use standard error. Closing the client's input stream or sending a shutdown signal triggers browser cleanup.
+
+On Linux with `/usr/bin/xvfb-run` and its Xvfb prerequisites already installed, use the launcher when a virtual display is needed:
+
+```sh
+./scripts/mcp-launch.sh node dist/index.js
+```
+
+The launcher forwards its command and arguments while keeping the child process's diagnostics on standard error. A virtual display alone does not provide an interactive login window. For MCP integration, set `command` to the launcher's absolute path and pass the Node executable and server entry point in `args`.
 
 #### Add to Claude Configuration
 Add this to your Claude MCP configuration:
@@ -105,12 +116,15 @@ Retrieve your published Medium articles
 ```
 
 ### 3. `get-article-content`
-Get full content of any Medium article
-```typescript
-{
-  url: string  // Medium article URL
-}
+Read the content available to the current browser session. The supplied URL must use HTTPS on `medium.com` or one of its subdomains; custom publication domains are not accepted. Subscription restrictions and access challenges can still prevent full extraction.
+
+The optional `requireLogin` argument defaults to `true` and requests a login attempt, not mandatory authentication. If login fails or is unavailable, reading continues anonymously. Set it to `false` to skip the attempt; an already loaded session remains available. For example:
+
+```json
+{"url": "https://medium.com/@author/article-id", "requireLogin": false}
 ```
+
+See [Configuration](#configuration) for the extraction limit and truncation notice. The authoritative input schemas are registered in [src/index.ts](src/index.ts) and exposed through MCP `tools/list`.
 
 ### 4. `search-medium`
 Search Medium for articles by keywords
@@ -119,6 +133,8 @@ Search Medium for articles by keywords
   keywords: string[]  // Array of search terms
 }
 ```
+
+Search results contain excerpts in `content`, not full article bodies. Valid Medium destinations embedded in login links are decoded; rejected candidates allow later extraction strategies to run. Unknown applause counts are returned as `claps: null`, not inferred from other numbers on the page.
 
 ### 5. `login-to-medium`
 Manually trigger login process
@@ -130,10 +146,7 @@ Manually trigger login process
 ## How It Works
 
 ### First Time Setup
-1. **Run the server** - It will open a Chrome browser window
-2. **Login to Medium** - Complete login in the opened browser
-3. **Session saved** - Your login session is saved locally
-4. **Future runs** - No login required, runs headlessly
+Start the server and invoke a tool to start Chromium. For account access, call `login-to-medium` and complete the browser login dialog if needed. Public search does not request login. See [Configuration](#configuration) for browser mode and [Session Management](#session-management) for reuse.
 
 ### Browser Automation Flow
 ```
@@ -141,9 +154,9 @@ User Request → MCP Server → Playwright Browser → Medium Website → Respon
 ```
 
 ### Session Management
-- Login session stored in `medium-session.json`
-- Automatically reused on subsequent runs
-- Re-login only if session expires
+The server loads `medium-session.json` from its working directory. After observing a successful login, it saves browser storage there with owner-only file permissions (`0600`). This JSON is not encrypted. Keep it private and use a stable working directory to reuse the same session.
+
+An existing file alone does not prove authentication. Login checks look for account-specific page elements; an expired or unreadable session can require login again. There is no global session directory or migration. Public operations remain available without creating a session.
 
 ## Example Usage with Claude
 
@@ -166,7 +179,7 @@ Claude: Uses publish-article tool →
 
 ### Medium Changes
 - **Selectors outdated**: Medium occasionally changes their website structure
-- **Login blocked**: Use your regular browser to login first, then try again
+- **Login blocked**: Follow [First Time Setup](#first-time-setup) in the server-managed browser; a separate browser profile does not supply its session
 
 ### Common Errors
 - `Browser not initialized`: Restart the server
@@ -179,33 +192,21 @@ Claude: Uses publish-article tool →
 ```
 src/
 ├── index.ts           # Main MCP server
-├── browser-client.ts  # Playwright automation
-├── auth.ts           # Legacy auth (unused)
-└── client.ts         # Legacy API client (unused)
+└── browser-client.ts  # Playwright automation
 ```
 
 ### Testing
-```bash
-# Test browser automation
-node test-browser.js
-
-# Run MCP server
-npm start
-
-# Build project
-npm run build
-```
+See [CONTRIBUTING.md](CONTRIBUTING.md#testing) for commands and [the Chromium validation record](tests/CHROMIUM-VALIDATION.md) for the evidence and remaining remote-validation limits of this repair.
 
 ## Security Notes
-- ✅ **Local only** - No data sent to external servers
-- ✅ **Session encryption** - Browser handles all security
-- ✅ **No API keys** - Uses your existing Medium login
-- ⚠️ **Browser storage** - Session saved locally in JSON file
+- Browser operations send requests to Medium.
+- See [Session Management](#session-management) for storage location, permissions and protection requirements.
+- No Medium API credentials are used.
 
 ## Limitations
 - **Speed**: Browser automation is slower than API calls (10-30s vs 1-2s)
 - **Reliability**: Dependent on Medium's website structure
-- **Headless**: Requires display for initial login (can run headless after)
+- **Browser mode and login**: See [Configuration](#configuration)
 - **Rate limits**: Subject to Medium's normal usage limits
 
 ## Contributing
@@ -231,7 +232,7 @@ This entire Medium MCP Server was **developed by AI (Claude/Cursor AI) in just a
 - ✅ **Community Standards**: Contributing guidelines, changelog, proper licensing
 
 ### Current Status & Limitations
-- ✅ **Functional**: Works well in Claude MCP integration for core features
+- **Validation scope**: See [the Chromium validation record](tests/CHROMIUM-VALIDATION.md) for verified behavior and external limitations
 - ⚠️ **Google Login Sessions**: Couldn't solve persistent Google login sessions (use email/password instead)
 - ⚠️ **Short Development Time**: Rapid development may have overlooked edge cases
 - ⚠️ **Medium UI Changes**: Selectors may break if Medium updates their interface

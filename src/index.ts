@@ -226,14 +226,8 @@ class MediumMcpServer {
 async function main() {
   const server = new MediumMcpServer();
   
-  // Handle graceful shutdown.
-  //
-  // Le transport MCP est du stdio : quand le client disparaît, il ne signale
-  // rien — il ferme simplement le pipe. Sans garde sur EOF, ce serveur et son
-  // navigateur Playwright sous Xvfb survivaient indéfiniment. Constaté le
-  // 2026-08-28 : 324 chrome, 37 Xvfb et 58 processus node orphelins, dont
-  // certains vieux de 3 jours, saturant dbus (max_connections_per_user=256)
-  // au point de rendre systemctl inutilisable.
+  // La fermeture du flux MCP doit libérer le navigateur même sans signal.
+  // Sinon Chromium et son affichage virtuel peuvent survivre au client.
   let shuttingDown = false;
   const shutdown = async (reason: string) => {
     if (shuttingDown) return;

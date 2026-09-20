@@ -26,7 +26,7 @@ Thank you for your interest in contributing to Medium MCP Server! This project h
 3. **Build and Test**
    ```bash
    npm run build
-   node test-browser.js  # Test browser automation
+   node --test tests/browser-client.test.cjs
    ```
 
 ### Code Contributions
@@ -56,8 +56,13 @@ Thank you for your interest in contributing to Medium MCP Server! This project h
 - Log errors appropriately (use `console.error` for MCP compatibility)
 - Add retry logic for transient failures
 
-**Testing**
-- Test your changes with real Medium interactions
+#### Testing
+
+After `npm run build`, run `node --test tests/browser-client.test.cjs` for the behavioral checks using doubles. For controlled pages in a real browser, follow [the Chromium validation record](tests/CHROMIUM-VALIDATION.md), which owns the browser prerequisites, command and remote-validation limitations.
+
+Run `python3 scripts/test-mcp-launch.py` to check the launcher with the installed `/usr/bin/xvfb-run` and its Xvfb prerequisites. No formatter or linter is configured in this repository; `./node_modules/.bin/tsc --noEmit` performs the configured TypeScript static analysis without emitting build files.
+
+- Test remote behavior only with authorized Medium access
 - Verify session persistence works correctly
 - Test both login and non-login scenarios
 - Check that MCP tools return proper JSON responses
