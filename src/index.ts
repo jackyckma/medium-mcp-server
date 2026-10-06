@@ -28,7 +28,7 @@ class MediumMcpServer {
     // Tool for publishing articles (now browser-based)
     this.server.tool(
       "publish-article",
-      "Publish a new article on Medium using browser automation",
+      "Publish a new article on Medium using browser automation. content is Markdown; local images as ![alt](/absolute/path.png) are uploaded. isDraft=true returns the draft edit URL.",
       {
         title: z.string().min(1, "Title is required"),
         content: z.string().min(10, "Content must be at least 10 characters"),

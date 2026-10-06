@@ -91,11 +91,18 @@ Publish a new article to Medium
 ```typescript
 {
   title: string,      // Article title
-  content: string,    // Article content (markdown supported)
-  tags?: string[],    // Optional tags
+  content: string,    // Article content as Markdown (see below)
+  tags?: string[],    // Optional tags (applied when publishing, not on drafts)
   isDraft?: boolean   // Save as draft (default: false)
 }
+// Returns: { success, url?, error? }. For drafts, url is the draft's edit URL.
 ```
+
+`content` is converted to Medium's native blocks: headings, lists, quotes, inline
+formatting and fenced code blocks. Local images written as
+`![alt](/absolute/path/to/image.png)` (png, jpg, gif) are uploaded to Medium and
+inserted at that position. Medium autosaves the story as a draft while it is built, so
+`isDraft: true` stops before the publish dialog and returns the draft URL.
 
 ### 2. `get-my-articles`
 Retrieve your published Medium articles

@@ -1,6 +1,7 @@
 import { chromium, Browser, Page, BrowserContext } from 'playwright';
 import { writeFileSync, readFileSync, existsSync } from 'fs';
-import { join } from 'path';
+import { join, basename } from 'path';
+import { marked } from 'marked';
 
 export interface MediumArticle {
   title: string;
@@ -421,80 +422,140 @@ export class BrowserMediumClient {
     }
   }
 
+  /**
+   * Paste HTML (or an image file) into the focused Medium editor. Medium's editor
+   * converts pasted HTML into native blocks (headings, lists, code blocks) and
+   * uploads pasted image files to its own CDN.
+   */
+  private async pasteHtml(html: string): Promise<void> {
+    await this.page!.evaluate((h) => {
+      const dt = new DataTransfer();
+      dt.setData('text/html', h);
+      dt.setData('text/plain', h.replace(/<[^>]+>/g, ''));
+      document.activeElement?.dispatchEvent(
+        new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true })
+      );
+    }, html);
+    await this.page!.waitForTimeout(1000);
+  }
+
+  /**
+   * Markdown -> HTML shaped for Medium's paste handler. Medium splits a pasted <pre>
+   * at every blank line, so blank lines inside code get a single space; and a
+   * blockquote must hold bare text (inner <p>/newlines render as empty quote blocks).
+   */
+  private async markdownToEditorHtml(markdown: string): Promise<string> {
+    const html = await marked.parse(markdown);
+    return html
+      .replace(/<pre>[\s\S]*?<\/pre>/g, (pre) => pre.replace(/\n(?=\n)/g, '\n '))
+      .replace(/<blockquote>\s*<p>([\s\S]*?)<\/p>\s*<\/blockquote>/g, '<blockquote>$1</blockquote>');
+  }
+
+  private async pasteImage(path: string): Promise<void> {
+    const base64 = readFileSync(path).toString('base64');
+    const before = await this.page!.locator('.postArticle-content img.graf-image').count();
+    await this.page!.evaluate(({ b64, name }) => {
+      const bin = atob(b64);
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      const dt = new DataTransfer();
+      dt.items.add(new File([bytes], name, { type: 'image/png' }));
+      document.activeElement?.dispatchEvent(
+        new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true })
+      );
+    }, { b64: base64, name: basename(path) });
+    // Wait until the upload finishes and the image is served from Medium's CDN
+    await this.page!.waitForFunction(
+      (n) => {
+        const imgs = Array.from(document.querySelectorAll<HTMLImageElement>('.postArticle-content img.graf-image'));
+        return imgs.length > n && imgs.every(i => i.src.includes('cdn-images'));
+      },
+      before,
+      { timeout: 60000 }
+    );
+  }
+
+  /**
+   * Content is Markdown. Local images (`![alt](/absolute/path.png)`) are uploaded
+   * through the editor. Medium autosaves everything as a draft, so isDraft just
+   * stops before the publish flow and returns the draft's edit URL.
+   */
   async publishArticle(options: PublishOptions): Promise<{ success: boolean; url?: string; error?: string }> {
     if (!this.page) throw new Error('Browser not initialized');
-    
+
     await this.ensureLoggedIn();
 
     try {
-      // Navigate to the new story page
       await this.page.goto('https://medium.com/new-story');
-      await this.page.waitForLoadState('networkidle');
+      const titleSelector = '.postArticle-content[contenteditable="true"] h3.graf--title';
+      // Medium's editor occasionally fails to mount on first load; reload once before giving up
+      try {
+        await this.page.waitForSelector(titleSelector, { timeout: 20000 });
+      } catch {
+        await this.page.reload();
+        await this.page.waitForSelector(titleSelector, { timeout: 30000 });
+      }
 
-      // Wait for the editor to load
-      await this.page.waitForSelector('[data-testid="richTextEditor"]', { timeout: 10000 });
-
-      // Add title
-      const titleSelector = '[data-testid="richTextEditor"] h1, [placeholder*="Title"], .graf--title';
-      await this.page.waitForSelector(titleSelector);
       await this.page.click(titleSelector);
-      await this.page.fill(titleSelector, options.title);
+      await this.page.keyboard.type(options.title);
+      await this.page.keyboard.press('Enter');
 
-      // Add content
-      const contentSelector = '[data-testid="richTextEditor"] p, .graf--p';
-      await this.page.waitForSelector(contentSelector);
-      await this.page.click(contentSelector);
-      
-      // Split content into paragraphs and add them
-      const paragraphs = options.content.split('\n\n').filter(p => p.trim());
-      for (let i = 0; i < paragraphs.length; i++) {
-        if (i > 0) {
-          await this.page.keyboard.press('Enter');
-          await this.page.keyboard.press('Enter');
-        }
-        await this.page.keyboard.type(paragraphs[i]);
+      // Paste the whole document once, with a placeholder paragraph where each
+      // image goes; then swap each placeholder for its uploaded image in place.
+      const imageRe = /!\[[^\]]*\]\((\/[^)\s]+\.(?:png|jpe?g|gif))\)/gi;
+      const images: string[] = [];
+      const withTokens = options.content.replace(imageRe, (_m, path: string) => {
+        if (!existsSync(path)) throw new Error(`Image not found: ${path}`);
+        images.push(path);
+        return `\n\nIMGTOKEN${images.length - 1}X\n\n`;
+      });
+      await this.pasteHtml(await this.markdownToEditorHtml(withTokens));
+      await this.page.waitForTimeout(1500);
+
+      for (let i = 0; i < images.length; i++) {
+        // Select the placeholder text through the DOM (a mouse click can be intercepted
+        // by a neighbouring figure), delete it, and leave the caret in the empty paragraph
+        const found = await this.page.evaluate((tok) => {
+          const editor = document.querySelector<HTMLElement>('.postArticle-content[contenteditable="true"]');
+          const el = Array.from(document.querySelectorAll<HTMLElement>('.postArticle-content p.graf'))
+            .find(p => p.textContent?.trim() === tok);
+          if (!editor || !el) return false;
+          editor.focus();
+          el.scrollIntoView({ block: 'center' });
+          const range = document.createRange();
+          range.selectNodeContents(el);
+          const sel = window.getSelection()!;
+          sel.removeAllRanges();
+          sel.addRange(range);
+          return true;
+        }, `IMGTOKEN${i}X`);
+        if (!found) throw new Error(`Image placeholder ${i} not found in editor`);
+        await this.page.keyboard.press('Backspace');
+        await this.pasteImage(images[i]);
       }
 
-      // Add tags if provided
-      if (options.tags && options.tags.length > 0) {
-        // Look for publish button to access settings
-        const publishButton = await this.page.locator('button:has-text("Publish"), [data-testid="publish-button"]').first();
-        if (await publishButton.isVisible()) {
-          await publishButton.click();
-          
-          // Wait for publish modal and add tags
-          await this.page.waitForSelector('[data-testid="tag-input"], input[placeholder*="tag"]', { timeout: 5000 });
-          
-          for (const tag of options.tags) {
-            await this.page.fill('[data-testid="tag-input"], input[placeholder*="tag"]', tag);
-            await this.page.keyboard.press('Enter');
-          }
-        }
-      }
+      // Give Medium's autosave time to persist the draft
+      await this.page.waitForURL(/\/p\/[0-9a-f]+\/edit/, { timeout: 30000 });
+      await this.page.waitForTimeout(3000);
+      const draftUrl = this.page.url();
 
       if (options.isDraft) {
-        // Save as draft
-        const saveButton = await this.page.locator('button:has-text("Save draft"), [data-testid="save-draft"]').first();
-        if (await saveButton.isVisible()) {
-          await saveButton.click();
-        }
-        return { success: true };
-      } else {
-        // Publish the article
-        const finalPublishButton = await this.page.locator('button:has-text("Publish now"), [data-testid="publish-now"]').first();
-        if (await finalPublishButton.isVisible()) {
-          await finalPublishButton.click();
-          
-          // Wait for success and get URL
-          await this.page.waitForLoadState('networkidle');
-          const currentUrl = this.page.url();
-          
-          return { success: true, url: currentUrl };
-        }
+        return { success: true, url: draftUrl };
       }
 
-      return { success: false, error: 'Could not find publish button' };
-
+      // Live publish: open the publish dialog, add tags, confirm
+      await this.page.locator('button:has-text("Publish")').first().click();
+      await this.page.waitForTimeout(2000);
+      if (options.tags?.length) {
+        const tagInput = this.page.locator('[data-testid="publishTopicsInput"], input[placeholder*="topic" i], input[placeholder*="tag" i]').first();
+        for (const tag of options.tags.slice(0, 5)) {
+          await tagInput.fill(tag);
+          await this.page.keyboard.press('Enter');
+        }
+      }
+      await this.page.locator('button:has-text("Publish now")').first().click();
+      await this.page.waitForLoadState('networkidle');
+      return { success: true, url: this.page.url() };
     } catch (error) {
       return { success: false, error: `Publishing failed: ${error}` };
     }
